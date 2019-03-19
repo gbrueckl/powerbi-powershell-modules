@@ -55,6 +55,10 @@ Convert-PowerBIDesktopToASTabular -pbiDesktopWindowName "*VanArsdel - Sales*" -o
         $outputPath
         ,
         [Parameter(Mandatory = $false)]
+        [int]
+        $compatibilityLevel = 1400
+        ,
+        [Parameter(Mandatory = $false)]
         [switch]
         $removeInternalPBITables
 	)
@@ -143,29 +147,34 @@ Convert-PowerBIDesktopToASTabular -pbiDesktopWindowName "*VanArsdel - Sales*" -o
                     {                        
                        foreach($obj in $mExpression) 
                        {
-                            if ($obj.name.Trim() -eq $table.Name.Trim()) 
+                            if ($obj.name.Replace("#","").Replace('"','').Trim() -eq $table.Name.Trim()) 
                             { 
-                                $mExpression = $obj.expression 
-                            }                            
-                            else 
-                            {
-                                $exist = $database.Model.Expressions |? { $_.Name.Trim() -eq $obj.name.Trim() }
-
-                                if ($exist.Count -eq 0 -and -not($obj.name.Trim().Contains("QueryBinding")))
+                                if($table.Name.Contains(' '))
                                 {
-                                    $ex = new-object Microsoft.AnalysisServices.Tabular.NamedExpression
+                                    $mExpression = "let`n`tSource = #`"$($obj.name.Trim())`"`nin Source"
+                                } else {
+                                    $mExpression = "let`n`tSource = $($obj.name)`nin Source"
+                                }
+                            }  
+                                                      
+                            $exist = $database.Model.Expressions | Where-Object { $_.Name.Trim() -eq $obj.name.Trim() }
 
-                                    $ex.Name = $obj.name.Trim()
+                            if ($exist.Count -eq 0 `
+                                    -and -not($obj.name.Trim().Contains("QueryBinding")) `
+                                    )
+                            {
+                                $ex = new-object Microsoft.AnalysisServices.Tabular.NamedExpression
+                                    
+                                $ex.Name = $obj.name.Trim()
 
-                                    $ex.Kind = new-object Microsoft.AnalysisServices.Tabular.ExpressionKind
+                                $ex.Kind = new-object Microsoft.AnalysisServices.Tabular.ExpressionKind
 
-                                    $ex.Description = ""
+                                $ex.Description = ""
 
-                                    $ex.Expression = $obj.expression
+                                $ex.Expression = $obj.expression
 
-                                    $database.Model.Expressions.Add($ex)
-                                } 
-                            }                          
+                                $database.Model.Expressions.Add($ex)
+                            }                         
                         }
                        
                     }                
@@ -182,6 +191,7 @@ Convert-PowerBIDesktopToASTabular -pbiDesktopWindowName "*VanArsdel - Sales*" -o
         
         $database.Model.DataSources.Clear()
 
+        $database.CompatibilityLevel = $compatibilityLevel
         $serializeOptions = new-object Microsoft.AnalysisServices.Tabular.SerializeOptions        
         $serializeOptions.IgnoreTimestamps = $true
         $serializeOptions.IgnoreInferredProperties = $true
@@ -251,6 +261,8 @@ Export-PBIDesktopToCSV -pbiDesktopWindowName "*Van Arsdel*" -outputPath ".\CSVOu
         $pbiDesktopWindowName,
 		[Parameter(Mandatory = $false)]        
 		[string[]] $tables,
+        [Parameter(Mandatory = $false)]        
+		[string] $daxQuery,
 		[Parameter(Mandatory = $true)]    
 		[string] $outputPath		
       )
@@ -276,9 +288,24 @@ Export-PBIDesktopToCSV -pbiDesktopWindowName "*Van Arsdel*" -outputPath ".\CSVOu
 		$tables = $modelTables |% {$_.Name}
 	}
 
+    if([System.IO.Path]::HasExtension($outputPath))
+    {
+        $outputFile = [System.IO.Path]::GetFileNameWithoutExtension($outputPath)
+        $outputPath = [System.IO.Path]::GetDirectoryName($outputPath)
+    }
+    else
+    {
+        $outputFile = "DaxQuery"
+    }
+
     if (-not (Test-Path $outputPath))
     {
         [System.IO.Directory]::CreateDirectory($outputPath) | Out-Null
+    }
+
+    if (![string]::IsNullOrEmpty($daxQuery))
+    {
+        $tables = @($outputFile)
     }
 		
 	$tables |% {
@@ -290,8 +317,15 @@ Export-PBIDesktopToCSV -pbiDesktopWindowName "*Van Arsdel*" -outputPath ".\CSVOu
 		
 		    Write-Verbose "Moving data from '$daxTableName' into CSV File"
 		
+            $cmd = "EVALUATE('$daxTableName')"
+
+            if (![string]::IsNullOrEmpty($daxQuery))
+            {
+                $cmd = $daxQuery
+            }
+            
 		    $reader = Invoke-SQLCommand -providerName "System.Data.OleDb" -connectionString $ssasConnStr `
-			    -executeType "Reader" -commandText "EVALUATE('$daxTableName')" 
+			    -executeType "Reader" -commandText $cmd 
 		
 		    Write-Verbose "Copying data from into '$tableCsvPath'"
   
@@ -803,23 +837,49 @@ Function Get-CleanMCode{
 
        # lets create expressions for each shared
       
-       $ex = $mcode.Split(';')
+       #$ex = $mcode.Split(';')
+       $ex = $mcode -split "shared "
 
-        For ($i=1; $i -lt $ex.Count-1; $i++) {
+        For ($i=1; $i -le $ex.Count-1; $i++) {
 
-            $ex[$i] = $ex[$i].Trim()
+            if(-Not ($ex[$i].Contains("IsParameterQuery")))
+            {
+                $ex[$i] = $ex[$i].Trim()
 
-            $ex[$i] = $ex[$i].Remove(0,6)
+                $tam = $ex[$i].indexOf('=') + 1
 
-            $tam = $ex[$i].indexOf('=') + 1
+                #Remove extra auto code coming from PowerBI
+                $t = ($ex[$i].Substring($tam,$ex[$i].Length-$tam)) -split "AutoRemovedColumns1"
 
-            $M = New-Object PSObject -Property @{
-                 hiddenTable = $true
-                 expression = $ex[$i].Substring($tam,$ex[$i].Length-$tam)
-                 name = $ex[$i].Split('=')[0]
-             } 
+                $dd = $t[0].Trim().Split([Environment]::NewLine)
+                
+                #Remove last comma
+                $t[0] = $t[0].Trim();
+                $t[0] = $t[0].Substring(0, ($t[0].Length)-1)
 
-            $colletion += $M
+                #Get last identifier
+                $lastId = $dd[-1].Split('=')
+
+                #Fix the ending
+                if(-Not ($t[0] -match '[\s.*]in[\s.*](?=([^"\\]*(\\.|"([^"\\]*\\.)*[^"\\]*"))*[^"]*$)'))
+                { 
+                    $t[0] += [Environment]::NewLine + " in " + $lastId[0].Trim()
+                }
+
+                $M = New-Object PSObject -Property @{
+                    hiddenTable = $true
+                    expression = $t[0]
+                    name = $ex[$i].Split('=')[0].Replace('#"','').Replace('"','')
+                } 
+
+                $colletion += $M
+            } else { # parameter expressions
+                $colletion += New-Object PSObject -Property @{
+                    hiddenTable = $true
+                    expression = $ex[$i].Split('=',2)[1].Replace(";","").Replace("`r","").Replace("`n","").Trim()
+                    name = $ex[$i].Split('=')[0].Replace('#"','').Replace('"','')
+                }
+            }
          }
     }
 
